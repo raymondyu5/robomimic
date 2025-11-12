@@ -875,3 +875,125 @@ class GaussianNoiseRandomizer(Randomizer):
         msg = header + f"(input_shape={self.input_shape}, noise_mean={self.noise_mean}, noise_std={self.noise_std}, " \
                        f"limits={self.limits}, num_samples={self.num_samples})"
         return msg
+
+
+class PointCloudRandomizer(Randomizer):
+    """
+    Randomly apply rotation, translation, and point shuffling to point clouds during training.
+    """
+    def __init__(
+        self,
+        input_shape,
+        rotation_range=0.2,
+        translation_range=0.06,
+        shuffle_points=True,
+        num_samples=1,
+    ):
+        super(PointCloudRandomizer, self).__init__()
+
+        self.input_shape = input_shape
+        self.rotation_range = rotation_range
+        self.translation_range = translation_range
+        self.shuffle_points = shuffle_points
+        self.num_samples = num_samples
+
+        if input_shape[-1] == 3:
+            self.channel_last = True
+            self.num_points = input_shape[0] if len(input_shape) == 2 else input_shape[1]
+        elif input_shape[0] == 3:
+            self.channel_last = False
+            self.num_points = input_shape[1] if len(input_shape) == 2 else input_shape[2]
+        else:
+            raise ValueError(
+                f"Expected input_shape with 3 channels (XYZ), got {input_shape}. "
+                f"Point clouds should be (N, 3) or (3, N)"
+            )
+
+    def output_shape_in(self, input_shape=None):
+        return list(self.input_shape)
+
+    def output_shape_out(self, input_shape=None):
+        return list(input_shape)
+
+    def _euler_to_rotation_matrix(self, euler_angles):
+        """
+        convert euler angles to a 3x3 rotation matrix.
+        """
+        roll, pitch, yaw = euler_angles[0], euler_angles[1], euler_angles[2]
+
+        cos_roll, sin_roll = torch.cos(roll), torch.sin(roll)
+        R_x = torch.tensor([
+            [1, 0, 0],
+            [0, cos_roll, -sin_roll],
+            [0, sin_roll, cos_roll]
+        ], dtype=euler_angles.dtype, device=euler_angles.device)
+
+        cos_pitch, sin_pitch = torch.cos(pitch), torch.sin(pitch)
+        R_y = torch.tensor([
+            [cos_pitch, 0, sin_pitch],
+            [0, 1, 0],
+            [-sin_pitch, 0, cos_pitch]
+        ], dtype=euler_angles.dtype, device=euler_angles.device)
+
+        cos_yaw, sin_yaw = torch.cos(yaw), torch.sin(yaw)
+        R_z = torch.tensor([
+            [cos_yaw, -sin_yaw, 0],
+            [sin_yaw, cos_yaw, 0],
+            [0, 0, 1]
+        ], dtype=euler_angles.dtype, device=euler_angles.device)
+
+        R = torch.mm(R_z, torch.mm(R_y, R_x))
+        return R
+
+    def _forward_in(self, inputs):
+        out = TensorUtils.repeat_by_expand_at(inputs, repeats=self.num_samples, dim=0).clone()
+
+        batch_size = out.shape[0]
+
+        if not self.channel_last:
+            out = out.transpose(-2, -1).contiguous()  # (B, 3, N) -> (B, N, 3)
+
+        # Apply random transformations to each sample in the batch
+        for i in range(batch_size):
+            # Generate random rotation (euler angles)
+            euler = (torch.rand(3, device=out.device, dtype=out.dtype) * 2 - 1) * self.rotation_range
+            rot_matrix = self._euler_to_rotation_matrix(euler)
+
+            # Generate random translation
+            translation = (torch.rand(3, device=out.device, dtype=out.dtype) * 2 - 1) * self.translation_range
+
+            out[i] = torch.mm(out[i], rot_matrix.T) + translation
+
+            # shuffle point order
+            if self.shuffle_points:
+                perm = torch.randperm(out.shape[1], device=out.device)
+                out[i] = out[i][perm]
+
+        if not self.channel_last:
+            out = out.transpose(-2, -1).contiguous()  # (B, N, 3) -> (B, 3, N)
+
+        return out
+
+    def _forward_out(self, inputs):
+        """
+        Average the encoded features across the num_samples augmentations.
+        """
+        batch_size = inputs.shape[0] // self.num_samples
+        out = TensorUtils.reshape_dimensions(
+            inputs,
+            begin_axis=0,
+            end_axis=0,
+            target_dims=(batch_size, self.num_samples)
+        )
+        return out.mean(dim=1)
+
+    def _visualize(self, pre_random_input, randomized_input, num_samples_to_visualize=2):
+        pass
+
+    def __repr__(self):
+        """Pretty print network."""
+        header = '{}'.format(str(self.__class__.__name__))
+        msg = header + f"(input_shape={self.input_shape}, rotation_range={self.rotation_range}, " \
+                       f"translation_range={self.translation_range}, shuffle_points={self.shuffle_points}, " \
+                       f"num_samples={self.num_samples})"
+        return msg
